@@ -1,14 +1,4 @@
----
-title: "CGS 4144 data exploration"
-output: pdf_document
-date: "2025-09-22"
----
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
-```{r}
 #installing necessary packages / libraries
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 if (!require(readr, quietly = TRUE))  install.packages("readr")
@@ -85,5 +75,3 @@ library(uwot)
 um <- umap(expr_mat, n_neighbors = min(15, max(2, nrow(expr_mat)-1)), metric = "cosine")
 umap_df <- data.frame(sample = rownames(expr_mat), UMAP1 = um[,1], UMAP2 = um[,2])
 ggplot(umap_df, aes(UMAP1, UMAP2)) + geom_point() + theme_minimal()
-```
-
