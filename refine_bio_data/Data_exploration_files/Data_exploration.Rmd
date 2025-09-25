@@ -1,0 +1,480 @@
+---
+title: "Data_exploration"
+output: pdf_document
+date: "2025-09-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#installing libraries/packages
+
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (!("org.Hs.eg.db" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("org.Hs.eg.db", update = FALSE)
+}
+BiocManager::install("DESeq2")
+
+BiocManager::install("topGO")
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(magrittr) #for piping from reference doc
+library(readr); library(dplyr); library(ggplot2)
+library(Rtsne); library(uwot); library(pheatmap); library(gprofiler2)
+library(limma)
+library(DESeq2)
+library(topGO)
+
+```
+```{r}
+#loading data and meta data
+#reading raw TSV file
+tsv_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/GSE60438.tsv"
+raw_data <- read_tsv(tsv_path)
+gene_ids <- raw_data[[1]]
+sample_names <- colnames(raw_data)[-1]
+
+expr_mat <- raw_data %>%
+  select(-1) %>%                          # drop the Gene column
+  mutate(across(everything(), as.numeric)) %>% 
+  as.matrix()
+
+rownames(expr_mat) <- gene_ids
+colnames(expr_mat) <- sample_names
+
+#reading meta data
+meta_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/metadata_GSE60438.tsv"
+meta <- readr::read_tsv(meta_path, show_col_types = FALSE)
+
+group_raw <- tolower(paste(
+  meta$refinebio_disease_stage,
+  meta$`characteristics_ch1_subject status`,
+  meta$title,
+  meta$description,
+  sep = " | "
+))
+
+pheno <- tibble::tibble(
+  sample = meta$refinebio_accession_code,
+  Group  = dplyr::case_when(
+    grepl("preeclamp|pre[- ]eclamp|\\bpe\\b", group_raw) ~ "Preeclampsia",
+    grepl("normotensive|control", group_raw)              ~ "Control",
+    TRUE ~ NA_character_
+  )
+) %>%
+  dplyr::filter(!is.na(sample), !is.na(Group)) %>%
+  dplyr::distinct(sample, .keep_all = TRUE)
+
+# Align expression to pheno
+expr_mat <- expr_mat[, pheno$sample, drop = FALSE]
+stopifnot(all(colnames(expr_mat) == pheno$sample))
+
+# Colors and factors used to graphing
+grp_cols <- c(Control = "lightblue", Preeclampsia = "pink")
+pheno$Group <- factor(pheno$Group, levels = c("Control", "Preeclampsia"))
+
+# Map Ensembl IDs -> HGNC symbols (returns a named character vector)
+core_ids <- sub("\\.\\d+$", "", rownames(expr_mat)) #normalize ens IDs 
+syms <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys     = core_ids,
+  column   = "SYMBOL",   # HGNC gene symbol
+  keytype  = "ENSEMBL",
+  multiVals = "first"
+)
+
+head(syms)
+# Fallback where no symbol is found
+missing <- is.na(syms) | syms == ""
+syms[missing] <- rownames(expr_mat)[missing]
+
+# Keep names and mapping rate
+names(syms) <- rownames(expr_mat)
+attr(syms, "mapping_rate") <- mean(!missing)
+
+#create symbols to have look up for ens IDs when plotting
+gene_lookup <- syms
+rowlabs <- unname(gene_lookup[rownames(expr_mat)])
+mr <- attr(syms, "mapping_rate")
+cat(sprintf("HGNC mapping rate: %.1f%%\n", 100 * mr))
+unmapped <- names(syms)[syms == names(syms)]
+head(unmapped)
+
+
+```
+```{r}
+#findings from matrix
+dimen <- dim(expr_mat)
+log_expr <- log2(expr_mat + 1)
+gene_medians <- matrixStats::rowMedians(log_expr)
+gene_ranges <- matrixStats::rowRanges(log_expr)
+gene_range_widths <- gene_ranges[,2] - gene_ranges[,1]
+
+cat("dimension: ", dimen, "\n")
+cat("example log-scale values:\n")
+print(log_expr[1:5, 1:5])
+cat("\nsummary of gene medians:\n")
+print(summary(gene_medians))
+
+```
+
+
+Plots:
+```{r}
+#density plots with color per group
+
+# Map rownames (ENSEMBL IDs) to HGNC symbols and update expr_mat rownames
+vars      <- apply(expr_mat, 1, var, na.rm = TRUE)
+top_ids   <- names(sort(vars, decreasing = TRUE))[1:min(15, nrow(expr_mat))]
+top_names <- unname(gene_lookup[top_ids])
+
+df_long <- as.data.frame(t(expr_mat[top_ids, , drop = FALSE]))
+df_long$sample <- rownames(df_long)
+
+df_long <- dplyr::left_join(df_long, pheno, by = "sample") %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(top_ids),   # gather the gene columns
+    names_to = "ID",
+    values_to = "Expr"
+  ) %>%
+  dplyr::mutate(Gene = factor(gene_lookup[ID], levels = unique(top_names)))
+
+ggplot(df_long, aes(x = Expr, color = Group, fill = Group)) +
+  geom_density(alpha = 0.25, linewidth = 0.8) +
+  facet_wrap(~ Gene, scales = "free") +
+  scale_color_manual(values = grp_cols, drop = FALSE) +
+  scale_fill_manual(values = grp_cols, drop = FALSE) +
+  labs(title = "Density of expression by gene and group",
+       x = "Expression", y = "Density", color = "Group", fill = "Group") +
+  theme_minimal()
+
+
+
+
+#a helper to plot any single gene by symbol
+plot_gene_density <- function(name_or_id) {
+  if (name_or_id %in% rownames(expr_mat)) {
+    ids <- name_or_id
+    label <- gene_lookup[ids]
+  } else {
+    ids <- names(gene_lookup)[gene_lookup == name_or_id]
+    if (length(ids) == 0) stop("Gene not found in gene_lookup: ", name_or_id)
+    label <- name_or_id
+  }
+  expr <- if (length(ids) == 1) as.numeric(expr_mat[ids, ])
+  else as.numeric(colMeans(expr_mat[ids, , drop = FALSE], na.rm = TRUE))
+  d <- data.frame(Expr = expr, sample = colnames(expr_mat)) %>%
+    left_join(pheno, by = "sample")
+  ggplot(d, aes(x = Expr, color = Group, fill = Group)) +
+    geom_density(alpha = 0.25, linewidth = 0.8) +
+    scale_color_manual(values = grp_cols, drop = FALSE) +
+    scale_fill_manual(values = grp_cols, drop = FALSE) +
+    labs(title = paste("Expression density:", label),
+         x = "Expression", y = "Density", color = "Group", fill = "Group") +
+    theme_minimal()
+}
+
+```
+```{r}
+#calcuate mean per group
+calc_stats <- function(g) {
+  idx <- which(pheno$Group == g)
+  X   <- expr_mat[, pheno$sample[idx], drop = FALSE]          # genes x samples (that group)
+  data.frame(
+    gene = rownames(expr_mat),
+    Group = g,
+    mean = rowMeans(X, na.rm = TRUE),
+    var  = if (length(idx) > 1) apply(X, 1, var, na.rm = TRUE) else NA_real_
+  )
+}
+
+groups <- levels(pheno$Group)
+gene_stats_by_group <- do.call(rbind, lapply(groups, calc_stats))
+gene_stats_by_group$sd <- sqrt(gene_stats_by_group$var)
+gene_stats_by_group$cv <- gene_stats_by_group$sd / (abs(gene_stats_by_group$mean) + 1e-8)
+
+# Mean–variance scatter plot
+plot_mv <- ggplot(gene_stats_by_group, aes(x = mean, y = var, color = Group)) +
+  geom_point(alpha = 0.5, size = 0.8) +
+  scale_x_log10() + scale_y_log10() +
+  scale_color_manual(values = grp_cols, drop = FALSE) +
+  labs(title = "Per-gene mean–variance by group",
+       x = "Mean expression (log10)", y = "Variance (log10)", color = "Group") +
+  theme_minimal() +
+  facet_wrap(~ Group, nrow = 1)
+print(plot_mv)
+#variance by group
+ggplot(gene_stats_by_group, aes(x = var, fill = Group)) +
+  geom_histogram(bins = 50, alpha = 0.6, color = "pink") +
+  scale_x_log10() +
+  scale_fill_manual(values = grp_cols, drop = FALSE) +
+  labs(title = "Per-gene variance by group", x = "Variance (log10)", y = "Genes") +
+  theme_minimal() +
+  facet_wrap(~ Group, nrow = 1, scales = "free_y")
+
+
+# Create samples x genes matrix with gene-wise z-scoring
+Xs <- scale(t(expr_mat), center = TRUE, scale = TRUE)  # rows = samples, cols = genes
+
+# Drop non-informative or non-finite genes
+keep <- apply(Xs, 2, function(v) sd(v, na.rm = TRUE) > 0 && all(is.finite(v)))
+Xs <- Xs[, keep, drop = FALSE]
+
+```
+
+
+
+```{r}
+
+#PCA plot
+pca <- prcomp(Xs, center = TRUE, scale. = TRUE)
+
+# determing variance 
+pve <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+pca_df <- data.frame(sample = pheno$sample, Group = pheno$Group,
+                     PC1 = pca$x[,1], PC2 = pca$x[,2])
+
+ggplot(pca_df, aes(PC1, PC2, color = Group)) +
+  geom_point(size = 2, alpha = 0.9) +
+  scale_color_manual(values = grp_cols) +
+  labs(
+    title = "PCA: Preeclampsia vs Control",
+    x = paste0("PC1 (", round(pve[1], 1), "%)"),
+    y = paste0("PC2 (", round(pve[2], 1), "%)"),
+    color = "Group"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+```{r}
+
+#t-SNE plot
+set.seed(42)
+perp <- max(5, min(30, floor(nrow(Xs)/3)))
+tsne <- Rtsne(Xs, perplexity = perp, check_duplicates = FALSE, verbose = TRUE)
+tsne_df <- data.frame(sample = pheno$sample, Group = pheno$Group,
+                      tSNE1 = tsne$Y[,1], tSSE2 = tsne$Y[,2])
+ggplot(tsne_df, aes(tSNE1, tSSE2, color = Group)) +
+  geom_point(size = 2, alpha = 0.9) +
+  scale_color_manual(values = grp_cols) +
+  labs(title = paste0("t-SNE (perplexity=", perp, ")"), color = "Group") +
+  theme_minimal()
+```
+
+
+```{r}
+#UMAP plot
+set.seed(42)
+um <- umap(Xs, n_neighbors = min(15, max(2, nrow(Xs) - 1)), metric = "cosine")
+umap_df <- data.frame(sample = pheno$sample, Group = pheno$Group,
+                      UMAP1 = um[,1], UMAP2 = um[,2])
+ggplot(umap_df, aes(UMAP1, UMAP2, color = Group)) +
+  geom_point(size = 2, alpha = 0.9) +
+  scale_color_manual(values = grp_cols) +
+  labs(title = "UMAP: Preeclampsia vs Control", color = "Group") +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+#heat map 
+expr_mat2 <- limma::avereps(expr_mat)
+keep <- apply(expr_mat2, 1, sd, na.rm = TRUE) > 0
+expr_mat2 <- expr_mat2[keep, , drop = FALSE]
+
+# Design and contrast (PE vs Control)
+pheno$Group <- factor(pheno$Group, levels = c("Control", "Preeclampsia"))
+design <- model.matrix(~ 0 + pheno$Group)
+colnames(design) <- levels(pheno$Group)
+contrast <- makeContrasts(PE_vs_Control = Preeclampsia - Control, levels = design)
+
+fit <- lmFit(expr_mat2, design) |> contrasts.fit(contrast) |> eBayes()
+
+# Differentially expressed genes (adjust thresholds as needed)
+res <- topTable(fit, coef = "PE_vs_Control", number = Inf, sort.by = "P")
+de_ids <- rownames(res %>% filter(adj.P.Val < 0.05, abs(logFC) >= 1))
+
+# Fallback if too few DE genes pass thresholds
+if (length(de_ids) < 20) {
+  de_ids <- rownames(res)[1:min(50, nrow(res))]
+}
+
+# Expression matrix for heatmap (DE genes only), gene-wise z-scores
+X <- expr_mat2[de_ids, , drop = FALSE]
+Xz <- t(scale(t(X), center = TRUE, scale = TRUE))
+Xz <- Xz[apply(Xz, 1, function(v) all(is.finite(v))), , drop = FALSE]  # remove any all-NA rows
+
+# Row labels: use gene symbols if available
+if (exists("gene_lookup")) {
+  rowlabs <- gene_lookup[rownames(Xz)]
+  rowlabs[is.na(rowlabs) | rowlabs == ""] <- rownames(Xz)
+  rownames(Xz) <- make.unique(rowlabs)
+}
+
+# Column annotation (sidebar)
+ann_col <- data.frame(Group = pheno$Group)
+rownames(ann_col) <- pheno$sample
+grp_cols <- c(Control = "lightblue", Preeclampsia = "pink")
+
+# Heatmap color palette
+pal <- colorRampPalette(c("navy", "white", "firebrick3"))(101)
+
+# Draw heatmap (clusters rows/cols, shows legends and sidebar)
+pheatmap(Xz,
+         color = pal,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_col = ann_col,
+         annotation_colors = list(Group = grp_cols),
+         fontsize_row = 4,
+         main = "Differentially expressed genes (z-scored)")
+
+```
+
+```{r}
+#volacano plot
+
+group <- pheno$Group
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+fit <- lmFit(log_expr, design)
+
+# Preeclampsia vs Control contrast matrix
+contrast.matrix <- makeContrasts(Preeclampsia - Control, levels = design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+res <- topTable(fit2, adjust.method = "BH", number = Inf)
+
+res$Gene <- syms[rownames(res)]
+volcano_df <- data.frame(
+  log2FC    = res$logFC,
+  negLog10P = -log10(res$P.Value),
+  padj      = res$adj.P.Val,
+  Gene      = res$Gene
+)
+
+volcano_df$Significance <- with(volcano_df,
+  ifelse(padj < 0.05 & abs(log2FC) > 0.05, "Significant", "Not significant")
+)
+
+cat("Gene counts:\n")
+print(table(volcano_df$Significance))
+
+ggplot(volcano_df, aes(x = log2FC, y = negLog10P, color = Significance)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Not significant" = "grey", "Significant" = "red")) +
+  labs(
+    title = "Volcano Plot: Preeclampsia vs Control",
+    x = "Log2 Fold Change",
+    y = "-Log10(p-value)",
+    color = "Gene Status"
+  ) +
+  theme_minimal()
+
+top_hits <- head(volcano_df[volcano_df$Significance == "Significant", ], 10)
+
+ggplot(volcano_df, aes(x = log2FC, y = negLog10P, color = Significance)) +
+  geom_point(alpha = 0.7) +
+  geom_text(data = top_hits, aes(label = Gene),
+            vjust = -1, size = 3, color = "black") +
+  scale_color_manual(values = c("Not significant" = "grey", "Significant" = "red")) +
+  labs(
+    title = "Volcano Plot with Top Genes Labeled",
+    x = "Log2 Fold Change",
+    y = "-Log10(p-value)",
+    color = "Gene Status"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+
+```
+
+```{r}
+#top 50 differentially expressed genes
+
+#order based on p-value & add symbols for gene name
+res_table <- res
+res_table$Gene <- syms[rownames(res_table)]
+
+
+#select and print the top 50
+top50 <- head(res_table, 50)
+top50_out <- top50[, c("Gene", "logFC", "P.Value", "adj.P.Val")]
+colnames(top50_out) <- c("Gene", "log2FoldChange", "pvalue", "padj")
+
+print(top50_out)
+
+```
+
+
+```{r}
+#differential expression : Method TopGO
+
+#fitting a limma model
+design <- model.matrix(~ Group, data = pheno)
+fit    <- lmFit(expr_mat, design)
+fit    <- eBayes(fit)
+
+
+# Extracting significant DEGs (padj < 0.05)
+res_limma <- topTable(fit, coef = "GroupPreeclampsia", number = Inf, adjust.method = "BH")
+deg       <- rownames(res_limma)[res_limma$adj.P.Val < 0.05]
+
+#Map Ensembl to Entrez IDs 
+all_ids    <- sub("\\.\\d+$", "", rownames(expr_mat))
+deg_ids    <- sub("\\.\\d+$", "", deg)
+entrez_all <- mapIds(org.Hs.eg.db, keys = all_ids,    column="ENTREZID", keytype="ENSEMBL", multiVals="first")
+entrez_deg <- mapIds(org.Hs.eg.db, keys = deg_ids,    column="ENTREZID", keytype="ENSEMBL", multiVals="first")
+
+
+#Building a named factor vector for topGO 
+geneList <- factor(as.integer(entrez_all %in% entrez_deg))
+names(geneList) <- entrez_all
+
+#Create topGO data object and run enrichment and print results
+GOdata <- new("topGOdata",
+              ontology        = "BP",
+              allGenes        = geneList,
+              geneSelectionFun= function(x) x == 1,
+              annot           = annFUN.org,
+              mapping         = "org.Hs.eg.db",
+              ID              = "entrez")
+
+result_fisher <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
+
+
+topGO::GenTable(GOdata, Fisher = result_fisher, orderBy = "Fisher", topNodes = 20)
+
+
+
+#top 10 terms enriched by method
+
+top10_topGO <- GenTable(
+  GOdata,
+  Fisher = result_fisher,
+  orderBy = "Fisher",
+  topNodes = 10
+)
+
+print(top10_topGO)
+
+```
+
