@@ -1,0 +1,486 @@
+---
+title: "CGS4144 Assignment 3"
+output: pdf_document
+date: "2025-10-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#installing libraries/packages
+install.packages("tidymodels")
+library(readr)
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(matrixStats)
+library(tidyclust)
+library(tidymodels)
+library(recipes)
+library(workflows)
+library(parsnip)
+library(ggplot2)
+library(gprofiler2)
+library(limma)
+library(cluster)
+```
+
+```{r}
+
+
+#loading data and meta data
+#reading raw TSV file
+tsv_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/GSE60438.tsv"
+tsv_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/GSE60438.tsv"
+raw_data <- readr::read_tsv(tsv_path, show_col_types = FALSE)
+
+gene_ids <- raw_data[[1]]
+sample_names <- colnames(raw_data)[-1]
+
+expr_mat <- raw_data %>%
+  dplyr::select(-1) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric)) %>%
+  as.matrix()
+
+rownames(expr_mat) <- gene_ids
+colnames(expr_mat) <- sample_names
+
+#reading meta data
+meta_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/metadata_GSE60438.tsv"
+meta <- readr::read_tsv(meta_path, show_col_types = FALSE)
+
+group_raw <- tolower(paste(
+  meta$refinebio_disease_stage,
+  meta$`characteristics_ch1_subject status`,
+  meta$title,
+  meta$description,
+  sep = " | "
+))
+
+pheno <- tibble::tibble(
+  sample = meta$refinebio_accession_code,
+  Group  = dplyr::case_when(
+    grepl("preeclamp|pre[- ]eclamp|\\bpe\\b", group_raw) ~ "Preeclampsia",
+    grepl("normotensive|control", group_raw)              ~ "Control",
+    TRUE ~ NA_character_
+  )
+) %>%
+  dplyr::filter(!is.na(sample), !is.na(Group)) %>%
+  dplyr::distinct(sample, .keep_all = TRUE)
+
+# Align expression to pheno
+expr_mat <- expr_mat[, pheno$sample, drop = FALSE]
+stopifnot(all(colnames(expr_mat) == pheno$sample))
+
+# Colors and factors used to graphing
+grp_cols <- c(Control = "lightblue", Preeclampsia = "pink")
+pheno$Group <- factor(pheno$Group, levels = c("Control", "Preeclampsia"))
+
+# Map Ensembl IDs -> HGNC symbols (returns a named character vector)
+core_ids <- sub("\\.\\d+$", "", rownames(expr_mat)) # normalize ENS IDs
+syms <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys     = core_ids,
+  column   = "SYMBOL",
+  keytype  = "ENSEMBL",
+  multiVals = "first"
+)
+
+missing <- is.na(syms) | syms == ""
+syms[missing] <- rownames(expr_mat)[missing]
+names(syms) <- rownames(expr_mat)
+attr(syms, "mapping_rate") <- mean(!missing)
+
+gene_lookup <- syms
+rowlabs <- unname(gene_lookup[rownames(expr_mat)])
+mr <- attr(syms, "mapping_rate")
+cat(sprintf("HGNC mapping rate: %.1f%%\n", 100 * mr))
+
+
+head(syms)
+
+```
+
+
+```{r}
+set.seed(123)  # for reproducibility
+# Remove genes with all-NA or zero variance before ranking
+row_vars <- matrixStats::rowVars(expr_mat, na.rm = TRUE)
+valid <- is.finite(row_vars) & row_vars > 0
+
+expr_mat_valid <- expr_mat[valid, , drop = FALSE]
+row_vars_valid <- row_vars[valid]
+
+n_keep <- min(5000L, nrow(expr_mat_valid))
+top_idx <- order(row_vars_valid, decreasing = TRUE)[seq_len(n_keep)]
+expr_top <- expr_mat_valid[top_idx, , drop = FALSE]
+
+cat(sprintf("Selected %d most variable genes out of %d\n",
+            n_keep, nrow(expr_mat)))
+```
+
+
+```{r}
+#data for tidyclust
+dat <- t(expr_top) %>%
+  as.data.frame() %>%
+  tibble::as_tibble(rownames = "sample") %>%
+  dplyr::left_join(pheno, by = "sample")
+
+#normalize data
+rec <- recipe(~ ., data = dat) %>%
+  update_role(sample, Group, new_role = "id") %>%   # keep as identifiers only
+  step_zv(all_predictors()) %>%                    # remove zero-variance cols
+  step_normalize(all_predictors())                 # center/scale
+
+
+#K-mean where k=2
+k_spec <- k_means(num_clusters = 2) %>%
+  set_engine("stats")
+
+wf <- workflow() %>%
+  add_model(k_spec) %>%
+  add_recipe(rec)
+
+fit <- wf %>% fit(dat)
+
+# Get cluster assignments
+preds <- predict(fit, dat)  # returns a tibble with .pred_cluster
+clusters <- dat %>%
+  dplyr::select(sample, Group) %>%
+  dplyr::bind_cols(preds) %>%
+  dplyr::rename(cluster = .pred_cluster)
+
+print(head(clusters))
+
+# check against known groups 
+print(table(clusters$cluster, clusters$Group, useNA = "ifany"))
+```
+
+```{r}
+#Map each cluster to a "Control-like" / "Preeclampsia-like" label
+cluster_map <- clusters %>%
+  dplyr::mutate(cluster = as.character(cluster)) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(
+    major_group = names(sort(table(Group), decreasing = TRUE))[1],
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(cluster_label = paste0(major_group, "-like"))
+
+#Prep data used for PCA
+prep_rec <- recipes::prep(rec)
+X_tbl <- recipes::bake(prep_rec, new_data = NULL)
+
+X <- X_tbl %>%
+  dplyr::select(-sample, -Group) %>%
+  as.matrix()
+
+pca <- prcomp(X, center = FALSE, scale. = FALSE)
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2)
+
+#plotting frame with cluster labels
+clusters_min <- clusters %>%
+  dplyr::mutate(cluster = as.character(cluster)) %>%
+  dplyr::select(sample, cluster)
+
+pca_df <- tibble::tibble(
+  sample = X_tbl$sample,
+  Group  = X_tbl$Group,
+  PC1    = pca$x[, 1],
+  PC2    = pca$x[, 2]
+) %>%
+  dplyr::left_join(clusters_min, by = "sample") %>%
+  dplyr::left_join(cluster_map, by = "cluster")
+
+#Cluster centers in PC space 
+centers <- pca_df %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::summarise(PC1 = mean(PC1), PC2 = mean(PC2), .groups = "drop")
+
+#Plot 
+ggplot2::ggplot(pca_df, ggplot2::aes(x = PC1, y = PC2,
+                                     color = cluster_label, shape = Group)) +
+  ggplot2::geom_point(size = 3.2, alpha = 0.9) +
+  ggplot2::stat_ellipse(
+    data = pca_df,
+    ggplot2::aes(x = PC1, y = PC2, group = cluster_label, color = cluster_label),
+    inherit.aes = FALSE,
+    level = 0.75, size = 0.8, linetype = 2
+  ) +
+  ggplot2::scale_color_manual(values = c("Control-like" = "lightblue",
+                                         "Preeclampsia-like" = "pink")) +
+  ggplot2::scale_shape_manual(values = c("Control" = 16, "Preeclampsia" = 17)) +
+  ggplot2::labs(
+    title = "PCA of normalized expression",
+    subtitle = "Clusters relabeled by majority of known Group",
+    x = sprintf("PC1 (%.1f%% var)", 100 * var_expl[1]),
+    y = sprintf("PC2 (%.1f%% var)", 100 * var_expl[2]),
+    color = "Cluster",
+    shape = "Known Group"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "right",
+    panel.grid.minor = ggplot2::element_blank(),
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+```
+
+
+
+```{r}
+#testing K-means with different K values
+
+
+# Base PCA frame created from normalized predictors
+pca_base <- tibble::tibble(
+  sample = X_tbl$sample,
+  Group  = X_tbl$Group,
+  PC1    = pca$x[, 1],
+  PC2    = pca$x[, 2]
+)
+
+run_k <- function(k) {
+  spec <- tidyclust::k_means(num_clusters = k) %>%
+    parsnip::set_engine("stats")
+
+  wf_k <- workflows::workflow() %>%
+    workflows::add_model(spec) %>%
+    workflows::add_recipe(rec)
+
+  fit_k <- workflows::fit(wf_k, dat)
+  preds_k <- predict(fit_k, dat)
+
+  clusters_k <- dat %>%
+    dplyr::select(sample, Group) %>%
+    dplyr::bind_cols(preds_k) %>%
+    dplyr::rename(cluster = .pred_cluster) %>%
+    dplyr::mutate(cluster = as.character(cluster))
+
+
+  # Group vs cluster table
+  tab_grp <- table(clusters_k$cluster, clusters_k$Group, useNA = "ifany")
+
+  # Join clusters onto PCA for plotting
+  pca_k <- pca_base %>%
+    dplyr::left_join(clusters_k %>% dplyr::select(sample, cluster), by = "sample")
+
+  # Plots
+  plt <- ggplot2::ggplot(pca_k, ggplot2::aes(PC1, PC2, color = cluster, shape = Group)) +
+    ggplot2::geom_point(size = 3.2, alpha = 0.9) +
+    ggplot2::stat_ellipse(ggplot2::aes(group = cluster, color = cluster),
+                          level = 0.75, size = 0.8, linetype = 2) +
+    ggplot2::scale_color_brewer(palette = "Set2") +
+    ggplot2::scale_shape_manual(values = c("Control" = 16, "Preeclampsia" = 17)) +
+    ggplot2::labs(
+      title = sprintf("K-means (k = %d) on PCA of normalized expression", k),
+      subtitle = "Shapes = known Group; colors/ellipses = k-means clusters",
+      x = sprintf("PC1 (%.1f%% var)", 100 * var_expl[1]),
+      y = sprintf("PC2 (%.1f%% var)", 100 * var_expl[2]),
+      color = "Cluster", shape = "Known Group"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(legend.position = "right",
+                   panel.grid.minor = ggplot2::element_blank(),
+                   plot.title = ggplot2::element_text(face = "bold"))
+
+  list(k = k, clusters = clusters_k, tab_grp = tab_grp, plot = plt)
+}
+
+# different K values
+ks <- c(2, 3, 4, 5)
+results <- lapply(ks, run_k)
+names(results) <- paste0("k=", ks)
+
+# Print plots
+for (nm in names(results)) {
+  print(results[[nm]]$plot)
+  cat("\nGroup vs cluster table for", nm, ":\n")
+  print(results[[nm]]$tab_grp)
+}
+
+# Compare membership changes relative to k = 2
+k2_clusters <- results[["k=2"]]$clusters %>% dplyr::select(sample, k2 = cluster)
+
+for (k in ks[-1]) {
+  kk <- paste0("k=", k)
+  trans <- k2_clusters %>%
+    dplyr::left_join(results[[kk]]$clusters %>% dplyr::select(sample, kK = cluster), by = "sample")
+  cat("\nTransition table: k=2 vs", kk, "\n")
+  print(with(trans, table(k2, kK)))
+}
+```
+
+
+
+```{r}
+# Compare k-means stability across different numbers of genes (10, 100, 1000, 10000)
+set.seed(123)
+
+gene_counts <- c(10, 100, 500, 1000, 2500, 10000)
+ks <- c(2, 3, 4, 5)
+
+# Helper: finding top-n (n being the gene counts we want) most variable genes
+top_var <- function(expr, n) {
+  rv <- matrixStats::rowVars(expr, na.rm = TRUE)
+  ok <- is.finite(rv) & rv > 0
+  expr_ok <- expr[ok, , drop = FALSE]
+  rv_ok <- rv[ok]
+  n_keep <- min(n, nrow(expr_ok))
+  idx <- order(rv_ok, decreasing = TRUE)[seq_len(n_keep)]
+  expr_ok[idx, , drop = FALSE]
+}
+
+# Helper: run k-means for a given gene count across ks
+run_for_n <- function(n) {
+  expr_n <- top_var(expr_mat, n)
+
+  dat_n <- t(expr_n) %>%
+    as.data.frame() %>%
+    tibble::as_tibble(rownames = "sample") %>%
+    dplyr::left_join(pheno, by = "sample")
+
+  rec_n <- recipes::recipe(~ ., data = dat_n) %>%
+    recipes::update_role(sample, Group, new_role = "id") %>%
+    recipes::step_zv(recipes::all_predictors()) %>%
+    recipes::step_normalize(recipes::all_predictors())
+
+  out <- list()
+  for (k in ks) {
+    spec <- tidyclust::k_means(num_clusters = k) %>%
+      parsnip::set_engine("stats")
+    wf_k <- workflows::workflow() %>%
+      workflows::add_model(spec) %>%
+      workflows::add_recipe(rec_n)
+    fit_k <- workflows::fit(wf_k, dat_n)
+    preds_k <- predict(fit_k, dat_n)
+
+    clusters_k <- dat_n %>%
+      dplyr::select(sample) %>%
+      dplyr::bind_cols(preds_k) %>%
+      dplyr::rename(cluster = .pred_cluster) %>%
+      dplyr::mutate(cluster = as.character(cluster))
+
+    out[[as.character(k)]] <- clusters_k
+  }
+  out
+}
+
+# Run all gene counts
+results_by_n <- lapply(gene_counts, run_for_n)
+names(results_by_n) <- paste0("genes_", gene_counts)
+
+# Pairwise chi-squared tests between clusterings at the same k, across gene counts ; comparing gene counts and how they also affect the differnet values of K
+pair_indices <- combn(seq_along(gene_counts), 2, simplify = FALSE)
+
+chi_rows <- list()
+for (k in ks) {
+  for (pair in pair_indices) {
+    i <- pair[1]; j <- pair[2]
+    gi <- paste0("genes_", gene_counts[i])
+    gj <- paste0("genes_", gene_counts[j])
+
+    A <- results_by_n[[gi]][[as.character(k)]]
+    B <- results_by_n[[gj]][[as.character(k)]]
+
+    # Align by sample and build contingency
+    tab <- dplyr::left_join(A, B, by = "sample", suffix = c("_A", "_B")) %>%
+      { table(.$cluster_A, .$cluster_B) }
+
+    chi <- suppressWarnings(chisq.test(tab))
+    n <- sum(tab)
+    r <- nrow(tab); c <- ncol(tab)
+    cramer_v <- sqrt(chi$statistic / (n * min(r - 1, c - 1)))
+
+    chi_rows[[length(chi_rows) + 1]] <- data.frame(
+      k = k,
+      genes_A = gene_counts[i],
+      genes_B = gene_counts[j],
+      statistic = as.numeric(chi$statistic),
+      df = chi$parameter,
+      p_value = chi$p.value,
+      cramer_v = as.numeric(cramer_v)
+    )
+  }
+}
+chi_results <- do.call(rbind, chi_rows)
+chi_results <- chi_results[order(chi_results$k, chi_results$genes_A, chi_results$genes_B), ]
+
+# print the results table
+print(chi_results)
+write.table(chi_results, "results.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+```
+```{r}
+# Heatmap of the 5,000 genes used in clustering 
+
+# installing heatmap libraries/ packages
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+if (!requireNamespace("RColorBrewer", quietly = TRUE)) install.packages("RColorBrewer")
+
+# same normalized predictors as clustering
+prep_rec <- recipes::prep(rec)
+X_tbl <- recipes::bake(prep_rec, new_data = NULL)
+X <- X_tbl %>% dplyr::select(-sample, -Group) %>% as.matrix()   # samples x genes (z-scored by recipe)
+
+# Convert to genes x samples for heatmap; label rows with HGNC symbols where available
+heat_mat <- t(X)
+rowlabs_top <- unname(gene_lookup[colnames(X)])  # colnames(X) are the gene IDs used
+rownames(heat_mat) <- rowlabs_top
+colnames(heat_mat) <- X_tbl$sample
+
+# (k = 2)
+get_kmeans_clusters <- function(k) {
+  spec <- tidyclust::k_means(num_clusters = k) %>% parsnip::set_engine("stats")
+  wf_k <- workflows::workflow() %>% workflows::add_model(spec) %>% workflows::add_recipe(rec)
+  fit_k <- workflows::fit(wf_k, dat)
+  tibble::tibble(
+    sample = dat$sample,
+    !!paste0("k", k) := as.character(predict(fit_k, dat)$.pred_cluster)
+  )
+}
+
+cl2 <- get_kmeans_clusters(2)
+
+# Build annotation data frame for samples 
+ann_df <- X_tbl %>%
+  dplyr::select(sample, Group) %>%
+  dplyr::left_join(cl2, by = "sample")
+
+ann <- ann_df %>%
+  dplyr::select(Group, k2) %>%
+  as.data.frame()
+rownames(ann) <- ann_df$sample
+
+# Colors for annotation bars
+library(RColorBrewer)
+grp_cols <- c(Control = "lightblue", Preeclampsia = "pink")
+mk_pal <- function(n) brewer.pal(max(3, n), "Set2")[seq_len(n)]
+k2_lvls <- sort(unique(ann$k2))
+ann_colors <- list(
+  Group = grp_cols,
+  k2 = setNames(mk_pal(length(k2_lvls)), k2_lvls)
+)
+
+# plot heatmap w/ annotation sidebar
+pheatmap::pheatmap(
+  heat_mat,
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(101),
+  scale = "none",                     # already z-scored by recipe
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  annotation_col = ann,
+  annotation_colors = ann_colors,
+  main = "5,000 most variable genes (normalized); annotations: Group, k=2 clusters"
+)
+```
+
