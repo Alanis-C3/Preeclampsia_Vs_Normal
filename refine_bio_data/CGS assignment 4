@@ -1,0 +1,738 @@
+---
+title: "CGS4144 Assignment 4"
+output: pdf_document
+date: "2025-11-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#installing libraries/packages
+install.packages("tidymodels")
+install.packages("broom")
+install.packages("purrr")
+install.packages("glmnet")
+install.packages("pheatmap")
+install.packages("dplyr")
+install.packages("RColorBrewer")
+library(magrittr)
+library(pheatmap)
+library(RColorBrewer)
+library(recipes)
+library(glmnet)
+library(purrr)
+library(tibble)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(matrixStats)
+library(tidyclust)
+library(tidymodels)
+library(recipes)
+library(workflows)
+library(parsnip)
+library(ggplot2)
+library(gprofiler2)
+library(limma)
+library(cluster)
+library(broom)
+```
+
+```{r}
+#loading data and meta data
+#reading raw TSV file
+tsv_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/GSE60438.tsv"
+tsv_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/GSE60438.tsv"
+raw_data <- readr::read_tsv(tsv_path, show_col_types = FALSE)
+
+gene_ids <- raw_data[[1]]
+sample_names <- colnames(raw_data)[-1]
+
+expr_mat <- raw_data %>%
+  dplyr::select(-1) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric)) %>%
+  as.matrix()
+
+rownames(expr_mat) <- gene_ids
+colnames(expr_mat) <- sample_names
+
+#reading meta data
+meta_path <- "C:/Users/anae2/Preeclampsia_Vs_Normal/refine_bio_data/GSE60438/metadata_GSE60438.tsv"
+meta <- readr::read_tsv(meta_path, show_col_types = FALSE)
+
+group_raw <- tolower(paste(
+  meta$refinebio_disease_stage,
+  meta$`characteristics_ch1_subject status`,
+  meta$title,
+  meta$description,
+  sep = " | "
+))
+
+pheno <- tibble::tibble(
+  sample = meta$refinebio_accession_code,
+  Group  = dplyr::case_when(
+    grepl("preeclamp|pre[- ]eclamp|\\bpe\\b", group_raw) ~ "Preeclampsia",
+    grepl("normotensive|control", group_raw)              ~ "Control",
+    TRUE ~ NA_character_
+  )
+) %>%
+  dplyr::filter(!is.na(sample), !is.na(Group)) %>%
+  dplyr::distinct(sample, .keep_all = TRUE)
+
+# Align expression to pheno
+expr_mat <- expr_mat[, pheno$sample, drop = FALSE]
+stopifnot(all(colnames(expr_mat) == pheno$sample))
+
+# Colors and factors used to graphing
+grp_cols <- c(Control = "lightblue", Preeclampsia = "pink")
+pheno$Group <- factor(pheno$Group, levels = c("Control", "Preeclampsia"))
+
+# Map Ensembl IDs -> HGNC symbols (returns a named character vector)
+core_ids <- sub("\\.\\d+$", "", rownames(expr_mat)) # normalize ENS IDs
+syms <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys     = core_ids,
+  column   = "SYMBOL",
+  keytype  = "ENSEMBL",
+  multiVals = "first"
+)
+
+missing <- is.na(syms) | syms == ""
+syms[missing] <- rownames(expr_mat)[missing]
+names(syms) <- rownames(expr_mat)
+attr(syms, "mapping_rate") <- mean(!missing)
+
+gene_lookup <- syms
+rowlabs <- unname(gene_lookup[rownames(expr_mat)])
+mr <- attr(syms, "mapping_rate")
+cat(sprintf("HGNC mapping rate: %.1f%%\n", 100 * mr))
+
+
+head(syms)
+
+```
+
+```{r}
+# Remove genes with all-NA or zero variance before ranking
+row_vars <- matrixStats::rowVars(expr_mat, na.rm = TRUE)
+valid <- is.finite(row_vars) & row_vars > 0
+
+expr_mat_valid <- expr_mat[valid, , drop = FALSE]
+row_vars_valid <- row_vars[valid]
+
+n_keep <- min(5000L, nrow(expr_mat_valid))
+top_idx <- order(row_vars_valid, decreasing = TRUE)[seq_len(n_keep)]
+expr_top <- expr_mat_valid[top_idx, , drop = FALSE]
+
+cat(sprintf("Selected %d most variable genes out of %d\n",
+            n_keep, nrow(expr_mat)))
+
+#random seed for reproducibility
+set.seed(123)
+
+
+```
+
+```{r}
+# Load required tidymodels components explicitly
+if (!requireNamespace("parsnip", quietly = TRUE))   install.packages("parsnip")
+if (!requireNamespace("workflows", quietly = TRUE)) install.packages("workflows")
+if (!requireNamespace("tune", quietly = TRUE))      install.packages("tune")
+if (!requireNamespace("rsample", quietly = TRUE))   install.packages("rsample")
+if (!requireNamespace("recipes", quietly = TRUE))   install.packages("recipes")
+if (!requireNamespace("yardstick", quietly = TRUE)) install.packages("yardstick")
+if (!requireNamespace("dials", quietly = TRUE))     install.packages("dials")
+if (!requireNamespace("glmnet", quietly = TRUE))    install.packages("glmnet")
+library(parsnip); library(workflows); library(tune); library(rsample)
+library(recipes); library(yardstick); library(dials); library(glmnet); library(dplyr)
+
+# Ensure factor order (Control negative, Preeclampsia positive)
+train_df$Group <- factor(train_df$Group, levels = c("Control", "Preeclampsia"))
+test_df$Group  <- factor(test_df$Group,  levels = c("Control", "Preeclampsia"))
+
+# Recipe
+rec <- recipes::recipe(Group ~ ., data = train_df)
+rec <- recipes::update_role(rec, sample, new_role = "id")
+rec <- recipes::step_zv(rec, recipes::all_predictors())
+rec <- recipes::step_normalize(rec, recipes::all_predictors())
+
+# Lasso logistic spec (no pipes)
+log_spec <- parsnip::logistic_reg(penalty = tune::tune(), mixture = 1)
+log_spec <- parsnip::set_engine(log_spec, "glmnet")
+log_spec <- parsnip::set_mode(log_spec, "classification")
+
+# Workflow
+wf <- workflows::workflow()
+wf <- workflows::add_recipe(wf, rec)
+wf <- workflows::add_model(wf, log_spec)
+
+# Folds and grid (keep metrics simple: ROC AUC only for tuning)
+if (!exists("folds")) {
+  folds <- rsample::vfold_cv(train_df, v = 5, repeats = 2, strata = Group)
+}
+grid <- dials::grid_regular(dials::penalty(), levels = 20)
+metrics <- yardstick::metric_set(yardstick::roc_auc)
+
+# Tune
+set.seed(2025)
+tune_res <- tune::tune_grid(
+  wf,
+  resamples = folds,
+  grid      = grid,
+  metrics   = metrics,
+  control   = tune::control_grid(save_pred = TRUE)
+)
+
+# Pick best by ROC AUC (named argument)
+best <- tune::select_best(tune_res, metric = "roc_auc")
+
+# Manually finalize with best penalty
+final_spec <- parsnip::logistic_reg(penalty = best$penalty, mixture = 1)
+final_spec <- parsnip::set_engine(final_spec, "glmnet")
+final_spec <- parsnip::set_mode(final_spec, "classification")
+
+final_wf <- workflows::workflow()
+final_wf <- workflows::add_recipe(final_wf, rec)
+final_wf <- workflows::add_model(final_wf, final_spec)
+
+# Fit finalized model
+final_fit <- parsnip::fit(final_wf, data = train_df)
+
+# Test-set predictions
+test_probs <- predict(final_fit, test_df, type = "prob")
+test_class <- predict(final_fit, test_df, type = "class")
+test_results <- dplyr::bind_cols(
+  dplyr::select(test_df, sample, Group),
+  test_class,
+  test_probs
+)
+
+# Compute metrics (set positive class as 'second'; use a generic prob column)
+test_results$.pred_pos <- test_results[[".pred_Preeclampsia"]]
+test_metrics <- dplyr::bind_rows(
+  yardstick::accuracy(test_results, truth = Group, estimate = .pred_class),
+  tryCatch(
+    yardstick::roc_auc(test_results, truth = Group, .pred_pos, event_level = "second"),
+    error = function(e) yardstick::roc_auc(test_results, truth = Group, estimate = .pred_pos, event_level = "second")
+  ),
+  tryCatch(
+    yardstick::pr_auc(test_results, truth = Group, .pred_pos, event_level = "second"),
+    error = function(e) yardstick::pr_auc(test_results, truth = Group, estimate = .pred_pos, event_level = "second")
+  ),
+  yardstick::sens(test_results, truth = Group, estimate = .pred_class, event_level = "second"),
+  yardstick::spec(test_results, truth = Group, estimate = .pred_class, event_level = "second")
+)
+print(test_metrics)
+```
+```{r}
+# Heatmap of predictive signature genes with group annotation and dendrograms
+
+# Load libs
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+if (!requireNamespace("RColorBrewer", quietly = TRUE)) install.packages("RColorBrewer")
+if (!requireNamespace("broom", quietly = TRUE)) install.packages("broom")
+library(pheatmap); library(RColorBrewer); library(broom)
+
+# Collect signature genes from available fitted models (union)
+sig_group   <- character(0)
+sig_cluster <- character(0)
+
+# Try to extract from a fitted Group model
+if (exists("final_fit") && exists("best")) {
+  eng <- try(parsnip::extract_fit_engine(final_fit), silent = TRUE)
+  if (!inherits(eng, "try-error")) {
+    tb <- broom::tidy(eng, penalty = best$penalty)
+    sig_group <- tb$term[tb$term != "(Intercept)" & tb$estimate != 0]
+  }
+}
+
+# Try to extract from a fitted Cluster model (if you named it final_fit_cluster and best_cluster)
+if (exists("final_fit_cluster") && exists("best_cluster")) {
+  engc <- try(parsnip::extract_fit_engine(final_fit_cluster), silent = TRUE)
+  if (!inherits(engc, "try-error")) {
+    tbc <- broom::tidy(engc, penalty = best_cluster$penalty)
+    sig_cluster <- tbc$term[tbc$term != "(Intercept)" & tbc$estimate != 0]
+  }
+}
+
+# If you already have a vector 'all_signatures', include it
+if (exists("all_signatures")) {
+  sig_extra <- all_signatures
+} else {
+  sig_extra <- character(0)
+}
+
+signature_genes <- unique(c(sig_group, sig_cluster, sig_extra))
+if (length(signature_genes) == 0) {
+  stop("No signature genes found. Ensure a fitted model is available, or provide a vector 'all_signatures'.")
+}
+
+# Map signatures to rows in expr_mat via HGNC symbols
+row_syms <- unname(gene_lookup[rownames(expr_mat)])
+keep_idx <- which(row_syms %in% signature_genes)
+if (length(keep_idx) == 0) stop("None of the signature genes are present in expr_mat.")
+
+heat_raw <- expr_mat[keep_idx, , drop = FALSE]
+rownames(heat_raw) <- row_syms[keep_idx]  # label rows with HGNC symbols
+
+# Z-score per gene across samples
+heat_z <- t(scale(t(heat_raw)))
+heat_z[is.na(heat_z)] <- 0
+
+# Annotation: sample groups
+ann <- data.frame(Group = pheno$Group)
+rownames(ann) <- pheno$sample
+ann <- ann[colnames(heat_z), , drop = FALSE]
+
+# Colors
+grp_cols <- c(Control = "lightblue", Preeclampsia = "pink")
+ann_colors <- list(Group = grp_cols)
+hm_colors <- colorRampPalette(c("navy", "white", "firebrick3"))(101)
+
+# Heatmap with row/column dendrograms, legend, and labels
+pheatmap::pheatmap(
+  mat = heat_z,
+  color = hm_colors,
+  scale = "none",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  annotation_col = ann,
+  annotation_colors = ann_colors,
+  main = "Predictive signature genes (z-scored); annotation = Group",
+  fontsize_row = 7,
+  fontsize_col = 7,
+  legend = TRUE
+)
+```
+
+```{r}
+# Predicting k-means clusters (1-vs-rest) with lasso logistic regression
+
+# deps
+if (!requireNamespace("tidymodels", quietly = TRUE)) install.packages("tidymodels")
+if (!requireNamespace("tidyclust", quietly = TRUE)) install.packages("tidyclust")
+if (!requireNamespace("broom", quietly = TRUE)) install.packages("broom")
+library(tidymodels); library(tidyclust); library(broom)
+
+set.seed(2025)
+
+# Expect expr_top (genes x samples), pheno, dat, rec from your earlier chunks
+stopifnot(exists("expr_top"), exists("pheno"))
+
+# If cluster assignments from k=2 aren't in the environment, compute them
+if (!exists("clusters")) {
+  dat <- t(expr_top) %>%
+    as.data.frame() %>%
+    tibble::as_tibble(rownames = "sample") %>%
+    dplyr::left_join(pheno, by = "sample")
+
+  rec <- recipe(~ ., data = dat) %>%
+    update_role(sample, Group, new_role = "id") %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_predictors())
+
+  k_spec <- k_means(num_clusters = 2) %>% set_engine("stats")
+  wf_k2 <- workflow() %>% add_model(k_spec) %>% add_recipe(rec)
+  fit_k2 <- fit(wf_k2, dat)
+  preds_k2 <- predict(fit_k2, dat)
+
+  clusters <- dat %>%
+    dplyr::select(sample, Group) %>%
+    dplyr::bind_cols(preds_k2) %>%
+    dplyr::rename(cluster = .pred_cluster) %>%
+    dplyr::mutate(cluster = as.character(cluster))
+}
+
+# Identify the "cluster of interest" as the one that is Preeclampsia-majority; fallback to largest cluster
+cluster_map <- clusters %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    major_group = names(sort(table(Group), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+
+pe_like_cluster <- cluster_map %>%
+  dplyr::filter(major_group == "Preeclampsia") %>%
+  dplyr::slice_max(n, n = 1, with_ties = FALSE) %>%
+  dplyr::pull(cluster)
+
+if (length(pe_like_cluster) == 0) {
+  pe_like_cluster <- cluster_map %>% dplyr::slice_max(n, n = 1) %>% dplyr::pull(cluster)
+}
+
+# Build modeling DF: samples as rows, genes as cols; outcome = PE_like vs Other
+X <- t(expr_top)
+colnames(X) <- make.unique(unname(gene_lookup[rownames(expr_top)]))
+model_df <- X %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::left_join(clusters %>% dplyr::select(sample, Group, cluster), by = "sample") %>%
+  dplyr::mutate(
+    cluster_bin = factor(ifelse(cluster == pe_like_cluster, "PE_like", "Other"),
+                         levels = c("PE_like", "Other"))
+  ) %>%
+  dplyr::select(-cluster) %>%   # remove raw cluster label to avoid leakage
+  dplyr::filter(!is.na(cluster_bin))
+
+# Train/test split stratified on the binary cluster label
+split <- initial_split(model_df, prop = 0.8, strata = cluster_bin)
+train_df <- training(split)
+test_df  <- testing(split)
+
+# CV folds
+folds <- vfold_cv(train_df, v = 5, repeats = 2, strata = cluster_bin)
+
+# Recipe: keep IDs only; normalize predictors
+rec_clust <- recipe(cluster_bin ~ ., data = train_df) %>%
+  update_role(sample, new_role = "id") %>%
+  update_role(Group, new_role = "id") %>%  # do not use known Group as predictor
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+# L1-penalized logistic regression (lasso), tune penalty
+log_spec <- logistic_reg(penalty = tune(), mixture = 1) %>% set_engine("glmnet")
+wf <- workflow() %>% add_recipe(rec_clust) %>% add_model(log_spec)
+
+grid <- dials::grid_regular(dials::penalty(), levels = 40)
+metrics <- metric_set(roc_auc, pr_auc, accuracy, sens, spec)
+
+set.seed(2025)
+tuned <- tune_grid(
+  wf, resamples = folds, grid = grid, metrics = metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+best <- select_best(tuned, metric = "roc_auc")
+final_wf <- finalize_workflow(wf, best)
+final_fit <- fit(final_wf, data = train_df)
+
+# Test performance
+test_pred_prob <- predict(final_fit, test_df, type = "prob")
+test_pred_cls  <- predict(final_fit, test_df, type = "class")
+test_out <- bind_cols(test_df %>% dplyr::select(sample, cluster_bin),
+                      test_pred_cls, test_pred_prob)
+
+test_metrics <- bind_rows(
+  accuracy(test_out, truth = cluster_bin, estimate = .pred_class),
+  roc_auc(test_out, truth = cluster_bin, .pred_PE_like),
+  pr_auc(test_out, truth = cluster_bin, .pred_PE_like),
+  sens(test_out, truth = cluster_bin, estimate = .pred_class),
+  spec(test_out, truth = cluster_bin, estimate = .pred_class)
+)
+print(test_metrics)
+
+conf_mat(test_out, truth = cluster_bin, estimate = .pred_class)
+
+# ROC curve for test set
+autoplot(roc_curve(test_out, truth = cluster_bin, .pred_PE_like)) + ggplot2::theme_minimal()
+
+# Top non-zero coefficients at chosen penalty
+glmnet_fit <- extract_fit_engine(final_fit)
+coef_tbl <- broom::tidy(glmnet_fit, penalty = best$penalty) %>%
+  dplyr::filter(term != "(Intercept)", estimate != 0) %>%
+  dplyr::arrange(dplyr::desc(abs(estimate)))
+head(coef_tbl, 25)
+```
+
+
+```{r}
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(yardstick)
+# Recompute clusters if needed
+if (!exists("clusters")) {
+  dat <- t(expr_top) %>%
+    as.data.frame() %>%
+    tibble::as_tibble(rownames = "sample") %>%
+    dplyr::left_join(pheno, by = "sample")
+
+  rec <- recipe(~ ., data = dat) %>%
+    update_role(sample, Group, new_role = "id") %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_predictors())
+
+  k_spec <- tidyclust::k_means(num_clusters = 2) %>% parsnip::set_engine("stats")
+  wf_k2 <- workflows::workflow() %>% workflows::add_model(k_spec) %>% workflows::add_recipe(rec)
+  fit_k2 <- workflows::fit(wf_k2, dat)
+  preds_k2 <- predict(fit_k2, dat)
+
+  clusters <- dat %>%
+    dplyr::select(sample, Group) %>%
+    dplyr::bind_cols(preds_k2) %>%
+    dplyr::rename(cluster = .pred_cluster) %>%
+    dplyr::mutate(cluster = as.character(cluster))
+}
+
+# Map cluster of interest (PE-like)
+cluster_map <- clusters |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    major_group = names(sort(table(Group), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+
+# Pick the Preeclampsia-like cluster (fallback to largest if none)
+pe_rows <- cluster_map$major_group == "Preeclampsia"
+if (any(pe_rows)) {
+  # Among PE-majority rows, choose the one with max n
+  pe_like_cluster <- cluster_map$cluster[pe_rows][which.max(cluster_map$n[pe_rows])]
+} else {
+  pe_like_cluster <- cluster_map$cluster[which.max(cluster_map$n)]
+}
+
+# 3) Fix yardstick metric calls by specifying event_level = "second"
+# Example for your test-set metrics (Group model)
+# Ensure Group factor is levels c("Control","Preeclampsia")
+pheno$Group <- factor(pheno$Group, levels = c("Control", "Preeclampsia"))
+
+# Make sure the probability column name matches the positive class
+pos_name <- levels(test_results$Group)[2]               # "Preeclampsia"
+prob_col <- paste0(".pred_", pos_name)                  # ".pred_Preeclampsia"
+stopifnot(prob_col %in% colnames(test_results))
+
+# Make Preeclampsia the positive (second) level
+test_results$Group <- factor(test_results$Group, levels = c("Control", "Preeclampsia"))
+
+# Create a generic positive-prob column (no stray characters at end!)
+test_results$.pred_pos <- test_results[[".pred_Preeclampsia"]]
+
+# Metrics
+test_metrics_group <- dplyr::bind_rows(
+  yardstick::accuracy(test_results, truth = Group, estimate = .pred_class),
+  yardstick::roc_auc(test_results, truth = Group, .pred_pos, event_level = "second"),
+  yardstick::pr_auc(test_results, truth = Group, .pred_pos, event_level = "second"),
+  yardstick::sens(test_results, truth = Group, estimate = .pred_class, event_level = "second"),
+  yardstick::spec(test_results, truth = Group, estimate = .pred_class, event_level = "second")
+)
+print(test_metrics_group)
+
+# Example for cluster 1-vs-rest (levels c("Other","PE_like"))
+test_metrics_cluster <- dplyr::bind_rows(
+  accuracy(test_out, truth = cluster_bin, estimate = .pred_class),
+  roc_auc(test_out, truth = cluster_bin, .pred_PE_like, event_level = "second"),
+  pr_auc(test_out, truth = cluster_bin, .pred_PE_like, event_level = "second"),
+  sens(test_out, truth = cluster_bin, estimate = .pred_class, event_level = "second"),
+  spec(test_out, truth = cluster_bin, estimate = .pred_class, event_level = "second")
+)
+print(test_metrics_cluster)
+
+# Confusion matrix should now align with ROC/PR metrics
+conf_mat(test_out, truth = cluster_bin, estimate = .pred_class)
+```
+```{r}
+# Plots for confusion matrix, ROC curve, and AUC (robust to yardstick/tidy changes)
+
+
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("yardstick", quietly = TRUE)) install.packages("yardstick")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+library(ggplot2)
+library(yardstick)
+library(dplyr) 
+make_plots <- function(df, truth_col, pred_col, prob_col, label) {
+  stopifnot(all(c(truth_col, pred_col, prob_col) %in% names(df)))
+  tmp <- df
+  tmp$truth <- tmp[[truth_col]]
+  tmp$pred  <- tmp[[pred_col]]
+  tmp$prob  <- tmp[[prob_col]]
+
+  # Ensure positive class is the second level
+  if (truth_col == "Group") {
+    tmp$truth <- factor(tmp$truth, levels = c("Control", "Preeclampsia"))
+  } else if (truth_col == "cluster_bin") {
+    tmp$truth <- factor(tmp$truth, levels = c("Other", "PE_like"))
+  }
+
+  # Confusion matrix (row-normalized annotations)
+  cm_table <- table(Prediction = tmp$pred, Truth = tmp$truth)
+  cm_df <- as.data.frame(cm_table)
+  names(cm_df) <- c("Prediction", "Truth", "n")
+  totals <- aggregate(n ~ Truth, data = cm_df, sum)
+  cm_df <- merge(cm_df, totals, by = "Truth", suffixes = c("", "_total"))
+  cm_df$prop <- cm_df$n / cm_df$n_total
+
+  plt_cm <- ggplot(cm_df, aes(x = Prediction, y = Truth, fill = n)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%d\n(%.1f%%)", n, 100 * prop)), color = "black", size = 4) +
+    scale_fill_gradient(low = "#D7E8FF", high = "#2C6BE8") +
+    coord_fixed() +
+    labs(title = paste("Confusion Matrix (", label, ")", sep = ""),
+         x = "Predicted", y = "Actual", fill = "Count") +
+    theme_minimal()
+
+  # ROC and AUC
+  roc_tbl <- yardstick::roc_curve(tmp, truth = truth, estimate = prob, event_level = "second")
+  auc_val <- yardstick::roc_auc(tmp, truth = truth, estimate = prob, event_level = "second")$.estimate
+
+  plt_roc <- autoplot(roc_tbl) +
+    labs(title = paste0("ROC Curve (", label, ")"),
+         subtitle = sprintf("ROC AUC = %.3f", auc_val)) +
+    theme_minimal()
+
+  plt_auc <- ggplot(data.frame(metric = "ROC AUC", value = auc_val),
+                    aes(x = metric, y = value)) +
+    geom_col(width = 0.5, fill = "#2C6BE8") +
+    geom_hline(yintercept = 0.5, linetype = 2, color = "gray50") +
+    geom_text(aes(label = sprintf("%.3f", value)), vjust = -0.4, size = 4) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(title = paste0("AUC (", label, ")"), x = NULL, y = "AUC") +
+    theme_minimal()
+
+  list(cm = plt_cm, roc = plt_roc, auc = plt_auc)
+}
+
+# Group model plots (requires test_results with Group, .pred_class, .pred_Preeclampsia)
+if (exists("test_results") &&
+    all(c("Group", ".pred_class", ".pred_Preeclampsia") %in% names(test_results))) {
+  test_results$Group <- factor(test_results$Group, levels = c("Control", "Preeclampsia"))
+  grp_plots <- make_plots(test_results, "Group", ".pred_class", ".pred_Preeclampsia", "Group")
+  print(grp_plots$cm); print(grp_plots$roc); print(grp_plots$auc)
+}
+
+# Cluster model plots (requires test_out with cluster_bin, .pred_class, .pred_PE_like)
+if (exists("test_out") &&
+    all(c("cluster_bin", ".pred_class", ".pred_PE_like") %in% names(test_out))) {
+  test_out$cluster_bin <- factor(test_out$cluster_bin, levels = c("Other", "PE_like"))
+  cl_plots <- make_plots(test_out, "cluster_bin", ".pred_class", ".pred_PE_like", "Cluster (PE_like vs Other)")
+  print(cl_plots$cm); print(cl_plots$roc); print(cl_plots$auc)
+}
+```
+
+
+```{r}
+# Testing AUC of different model sizes to see gene count changing AUC and improving or not the model
+
+# deps
+if (!requireNamespace("glmnet", quietly = TRUE)) install.packages("glmnet")
+if (!requireNamespace("pROC", quietly = TRUE))   install.packages("pROC")
+if (!requireNamespace("matrixStats", quietly = TRUE)) install.packages("matrixStats")
+if (!requireNamespace("dplyr", quietly = TRUE))  install.packages("dplyr")
+if (!requireNamespace("tibble", quietly = TRUE)) install.packages("tibble")
+library(glmnet); library(pROC); library(matrixStats); library(dplyr); library(tibble)
+
+stopifnot(exists("expr_mat"), exists("pheno"), exists("gene_lookup"), exists("expr_top"))
+
+# helper: top-n most variable genes
+top_var <- function(expr, n) {
+  rv <- matrixStats::rowVars(expr, na.rm = TRUE)
+  ok <- is.finite(rv) & rv > 0
+  expr_ok <- expr[ok, , drop = FALSE]
+  rv_ok <- rv[ok]
+  idx <- order(rv_ok, decreasing = TRUE)[seq_len(min(n, nrow(expr_ok)))]
+  expr_ok[idx, , drop = FALSE]
+}
+
+# build Cluster labels if not present (k=2 on normalized 5000 genes)
+if (!exists("out_cluster")) {
+  X5000 <- t(expr_top)
+  X5000 <- scale(X5000)
+  set.seed(123)
+  km <- kmeans(X5000, centers = 2, nstart = 25)
+  clusters <- tibble(sample = rownames(X5000), cluster = as.character(km$cluster)) %>%
+    dplyr::left_join(pheno, by = "sample")
+
+  # map PE-like cluster by majority Group
+  cluster_map <- clusters %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::summarise(n = dplyr::n(),
+                     major_group = names(sort(table(Group), decreasing = TRUE))[1],
+                     .groups = "drop")
+  if (any(cluster_map$major_group == "Preeclampsia")) {
+    idx <- which(cluster_map$major_group == "Preeclampsia")
+    pe_like_cluster <- cluster_map$cluster[idx][which.max(cluster_map$n[idx])]
+  } else {
+    pe_like_cluster <- cluster_map$cluster[which.max(cluster_map$n)]
+  }
+  out_cluster <- clusters %>%
+    dplyr::mutate(cluster_bin = factor(ifelse(cluster == pe_like_cluster, "PE_like", "Other"),
+                                       levels = c("Other", "PE_like"))) %>%
+    dplyr::select(sample, cluster_bin)
+}
+
+# outcome data frames
+pheno2 <- pheno %>% dplyr::mutate(Group = factor(Group, levels = c("Control", "Preeclampsia"))) %>%
+  dplyr::select(sample, Group)
+
+# core AUC function using cv.glmnet
+run_cv_glmnet_auc <- function(expr_n, outcome_df, outcome_col, positive_label, seed = 2028) {
+  X <- t(expr_n)
+  # gene symbols as colnames
+  colnames(X) <- make.unique(unname(gene_lookup[rownames(expr_n)]))
+  df <- as.data.frame(X) %>% tibble::rownames_to_column("sample") %>%
+    dplyr::left_join(outcome_df, by = "sample") %>%
+    dplyr::filter(!is.na(.data[[outcome_col]]))
+
+  # split 80/20 manually (to avoid rsample dependency)
+  set.seed(seed)
+  n <- nrow(df)
+  idx <- sample(seq_len(n), size = floor(0.8 * n))
+  train <- df[idx, ]
+  test  <- df[-idx, ]
+
+  # standardize using training stats
+  Xtr <- as.matrix(train[, !(names(train) %in% c("sample", outcome_col))])
+  mu  <- colMeans(Xtr)
+  sdv <- apply(Xtr, 2, sd)
+  sdv[sdv == 0] <- 1
+  Xtr <- scale(Xtr, center = mu, scale = sdv)
+
+  Xte <- as.matrix(test[, !(names(test) %in% c("sample", outcome_col))])
+  Xte <- scale(Xte, center = mu, scale = sdv)
+
+  # binomial response (negative first, positive second)
+  ytr_fac <- factor(train[[outcome_col]], levels = c(setdiff(levels(train[[outcome_col]]), positive_label)[1], positive_label))
+  ytr <- as.integer(ytr_fac == positive_label)
+
+  cv <- glmnet::cv.glmnet(x = Xtr, y = ytr, family = "binomial", alpha = 1, nfolds = 5)
+  fit <- glmnet::glmnet(x = Xtr, y = ytr, family = "binomial", lambda = cv$lambda.min, alpha = 1)
+
+  # test probs and AUC
+  probs <- as.numeric(predict(fit, newx = Xte, type = "response"))
+  yte_fac <- factor(test[[outcome_col]], levels = c(setdiff(levels(train[[outcome_col]]), positive_label)[1], positive_label))
+  yte <- as.integer(yte_fac == positive_label)
+  as.numeric(pROC::auc(yte, probs))
+}
+
+# sweep gene counts
+gene_counts <- c(10, 100, 1000, 10000)
+
+group_auc <- sapply(gene_counts, function(n) {
+  expr_n <- top_var(expr_mat, n)
+  run_cv_glmnet_auc(expr_n, pheno2, outcome_col = "Group",       positive_label = "Preeclampsia")
+})
+cluster_auc <- sapply(gene_counts, function(n) {
+  expr_n <- top_var(expr_mat, n)
+  run_cv_glmnet_auc(expr_n, out_cluster, outcome_col = "cluster_bin", positive_label = "PE_like")
+})
+
+group_auc_df   <- tibble(genes = gene_counts, auc = as.numeric(group_auc))
+cluster_auc_df <- tibble(genes = gene_counts, auc = as.numeric(cluster_auc))
+print(group_auc_df)
+print(cluster_auc_df)
+```
+
+
+```{r}
+
+```
+
